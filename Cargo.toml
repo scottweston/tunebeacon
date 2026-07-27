@@ -1,0 +1,48 @@
+[package]
+name = "tunebeacon"
+version = "0.1.0"
+edition = "2024"
+description = "Privacy-first MPRIS now-playing delivery over MQTT and webhooks"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+dirs = "6.0"
+futures-util = "0.3"
+hostname = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+musicbrainz_rs = { version = "0.13", features = ["async", "rustls"] }
+ratatui = "0.30"
+ratatui-image = { version = "11.0", default-features = false, features = ["crossterm", "tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+rumqttc = "0.25"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1.47", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tui-input = "0.15"
+unicode-normalization = "0.1"
+url = "2.5"
+zbus = { version = "5.11", default-features = false, features = ["tokio"] }
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "warn"

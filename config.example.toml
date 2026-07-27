@@ -1,0 +1,26 @@
+version = 1
+
+[players]
+# Stable DesktopEntry keys, ordered from highest to lowest priority.
+allowlist = []
+
+[verification]
+# false is strict mode; true publishes marked failures.
+publish_unverified = false
+
+[mqtt]
+enabled = false
+host = ""
+port = 1883
+tls = false
+username = ""
+password = ""
+topic = "tunebeacon/your-hostname/now-playing"
+qos = 1
+retain = false
+
+[webhook]
+enabled = false
+url = "https://example.com/hooks/now-playing"
+# Optional Authorization: Bearer header. Masked in the TUI.
+bearer_token = ""
