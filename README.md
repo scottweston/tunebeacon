@@ -1,5 +1,7 @@
 # TuneBeacon
 
+![Screenshot](assets/screenshot_00.webp)
+
 TuneBeacon is a privacy-first Linux application that publishes verified “now
 playing” metadata from explicitly approved MPRIS players to MQTT, HTTP
 webhooks, or both.
