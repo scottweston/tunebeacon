@@ -1,6 +1,7 @@
 pub mod artwork;
 pub mod config;
 pub mod domain;
+pub mod lastfm;
 pub mod mpris;
 pub mod mqtt;
 pub mod runtime;

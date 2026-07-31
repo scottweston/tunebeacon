@@ -4,7 +4,7 @@
 
 TuneBeacon is a privacy-first Linux application that publishes verified “now
 playing” metadata from explicitly approved MPRIS players to MQTT, HTTP
-webhooks, or both.
+webhooks, and Last.fm.
 
 It is a single Rust binary with two modes:
 
@@ -27,6 +27,8 @@ explicitly allow one.
   enabled.
 - MQTT and webhooks are disabled by default. MQTT retain defaults to false and
   QoS defaults to 1.
+- Last.fm scrobbling is disabled by default and uses the same MusicBrainz
+  verification policy as the other outbound integrations.
 - Local `file://` artwork is displayed locally but never appears in published
   JSON.
 
@@ -47,7 +49,7 @@ permissions. Cached verification results and artwork live under
 
 The TUI keys are shown in context. The main controls are:
 
-- `1`–`5` or arrow keys: switch views.
+- `1`–`6` or arrow keys: switch views.
 - Players: `Space` allows/denies; `Shift+Up/Down` changes priority.
 - MQTT: `Up/Down` selects a field and `Enter` edits it; input supports normal
   cursor, Home/End, Delete/Backspace, and word movement. `e` enables MQTT,
@@ -55,17 +57,36 @@ The TUI keys are shown in context. The main controls are:
   connection.
 - Webhook: `Up/Down` selects the URL or optional bearer token and `Enter` edits
   it. `e` enables webhook delivery and `c` sends a diagnostic test POST.
+- Last.fm: enter an API key and shared secret, then press `a` to authorize the
+  account in a browser and `a` again when approval is complete. `e` enables
+  scrobbling and `d` disconnects the account. Shared secrets and session keys
+  are masked.
 - Verification: `f` toggles marked fallback publishing.
 - `s`: save configuration; `q`: quit.
 
-MQTT passwords and webhook bearer tokens are masked in the interface. The
-[example configuration](config.example.toml) documents every v1 setting.
+MQTT passwords, webhook bearer tokens, and sensitive Last.fm credentials are
+masked in the interface. The [example configuration](config.example.toml)
+documents every v1 setting.
+
+## Last.fm scrobbling
+
+Create a [Last.fm API account](https://www.last.fm/api/account/create), enter
+its API key and shared secret on the Last.fm tab, and complete the browser
+authorization flow. Press `s` to persist the resulting session key in the
+owner-only configuration file.
+
+For eligible tracks TuneBeacon sends the recommended now-playing update, then
+scrobbles after more than 30 seconds of music has played and the earlier of
+half the track or four minutes has elapsed. Paused time does not count.
+Transient scrobble failures retry with backoff; now-playing failures do not
+retry. See Last.fm's [scrobbling guide](https://www.last.fm/api/scrobbling).
 
 ## Daemon mode
 
 Daemon mode refuses to start unless at least one output is enabled and every
 enabled output is complete. MQTT requires its host, port, and topic; webhook
-delivery requires an `http://` or `https://` URL:
+delivery requires an `http://` or `https://` URL; Last.fm requires an API key,
+shared secret, and authorized session key:
 
 ```console
 tunebeacon daemon

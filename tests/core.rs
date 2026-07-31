@@ -55,12 +55,30 @@ fn defaults_are_private_and_conservative() {
     assert!(!config.verification.publish_unverified);
     assert!(!config.mqtt.enabled);
     assert!(!config.webhook.enabled);
+    assert!(!config.lastfm.enabled);
+    assert!(config.lastfm.api_key.is_empty());
+    assert!(config.lastfm.shared_secret.is_empty());
+    assert!(config.lastfm.session_key.is_empty());
+    assert!(config.lastfm.username.is_empty());
     assert!(config.webhook.url.is_empty());
     assert!(config.webhook.bearer_token.is_none());
     assert!(!config.mqtt.retain);
     assert_eq!(config.mqtt.qos, 1);
     assert!(config.mqtt.topic.starts_with("tunebeacon/"));
     assert!(config.mqtt.topic.ends_with("/now-playing"));
+}
+
+#[test]
+fn daemon_accepts_lastfm_as_an_independent_output_when_authorized() {
+    let mut config = Config::default();
+    config.lastfm.enabled = true;
+    assert!(config.validate_daemon().is_err());
+    config.lastfm.api_key = "api-key".to_owned();
+    config.lastfm.shared_secret = "shared-secret".to_owned();
+    assert!(config.validate_daemon().is_err());
+    config.lastfm.session_key = "session-key".to_owned();
+    config.lastfm.username = "listener".to_owned();
+    assert!(config.validate_daemon().is_ok());
 }
 
 #[test]

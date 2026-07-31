@@ -1,12 +1,13 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use anyhow::Result;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::{Config, MqttConfig, WebhookConfig},
+    config::{Config, LastFmConfig, MqttConfig, WebhookConfig},
     domain::{NowPlayingMessage, Player, TrackIdentity, Verification, VerificationStatus},
+    lastfm::{LastFmPublisher, LastFmStatus, PlaybackTracker, ScrobbleAction},
     mpris::MprisMonitor,
     mqtt::{MqttPublisher, MqttStatus},
     selection::{PublicationGate, select_player},
@@ -21,6 +22,7 @@ pub struct RuntimeState {
     pub verification: Option<Verification>,
     pub mqtt: MqttStatus,
     pub webhook: WebhookStatus,
+    pub lastfm: LastFmStatus,
     pub error: Option<String>,
 }
 
@@ -49,6 +51,14 @@ struct Outputs {
     webhook_config: WebhookConfig,
     webhook: Option<WebhookPublisher>,
     webhook_gate: PublicationGate,
+    lastfm_config: LastFmConfig,
+    lastfm: Option<LastFmPublisher>,
+}
+
+#[derive(Debug, Default)]
+struct OutputChanges {
+    any: bool,
+    lastfm: bool,
 }
 
 impl Outputs {
@@ -62,6 +72,10 @@ impl Outputs {
         let webhook = webhook_config
             .enabled
             .then(|| WebhookPublisher::spawn(webhook_config.clone()));
+        let lastfm_config = current.lastfm.clone();
+        let lastfm = lastfm_config
+            .enabled
+            .then(|| LastFmPublisher::spawn(lastfm_config.clone()));
         Self {
             mqtt_config,
             mqtt,
@@ -69,12 +83,14 @@ impl Outputs {
             webhook_config,
             webhook,
             webhook_gate: PublicationGate::default(),
+            lastfm_config,
+            lastfm,
         }
     }
 
-    async fn refresh(&mut self, config: &RwLock<Config>) -> bool {
+    async fn refresh(&mut self, config: &RwLock<Config>) -> OutputChanges {
         let latest = config.read().await;
-        let mut changed = false;
+        let mut changes = OutputChanges::default();
         if latest.mqtt != self.mqtt_config {
             self.mqtt_config.clone_from(&latest.mqtt);
             self.mqtt = self
@@ -82,7 +98,7 @@ impl Outputs {
                 .enabled
                 .then(|| MqttPublisher::spawn(self.mqtt_config.clone()));
             self.mqtt_gate.observe_idle();
-            changed = true;
+            changes.any = true;
         }
         if latest.webhook != self.webhook_config {
             self.webhook_config.clone_from(&latest.webhook);
@@ -91,9 +107,18 @@ impl Outputs {
                 .enabled
                 .then(|| WebhookPublisher::spawn(self.webhook_config.clone()));
             self.webhook_gate.observe_idle();
-            changed = true;
+            changes.any = true;
         }
-        changed
+        if latest.lastfm != self.lastfm_config {
+            self.lastfm_config.clone_from(&latest.lastfm);
+            self.lastfm = self
+                .lastfm_config
+                .enabled
+                .then(|| LastFmPublisher::spawn(self.lastfm_config.clone()));
+            changes.any = true;
+            changes.lastfm = true;
+        }
+        changes
     }
 
     fn clear_if_idle(&mut self) {
@@ -119,6 +144,14 @@ impl Outputs {
         {
             webhook.publish_latest(message);
             self.webhook_gate.mark_published(player);
+        }
+    }
+
+    fn submit_lastfm(&self, actions: impl IntoIterator<Item = ScrobbleAction>) {
+        if let Some(lastfm) = &self.lastfm {
+            for action in actions {
+                lastfm.submit(action);
+            }
         }
     }
 }
@@ -162,6 +195,7 @@ async fn run_loop(
     };
     let verifier = Arc::new(Verifier::new(cache_dir));
     let mut outputs = Outputs::new(&config).await;
+    let mut lastfm_tracker = PlaybackTracker::default();
     let (verified_tx, mut verified_rx) = mpsc::channel::<VerifiedResult>(1);
     let mut active: Option<(String, TrackIdentity)> = None;
     let mut generation = 0_u64;
@@ -170,20 +204,15 @@ async fn run_loop(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        let event = tokio::select! {
-            () = shutdown.cancelled() => LoopEvent::Shutdown,
-            _ = interval.tick() => LoopEvent::Refresh,
-            () = monitor.changed() => {
-                // Players often emit title, artist, album, and length separately.
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                LoopEvent::Refresh
-            }
-            Some(result) = verified_rx.recv() => LoopEvent::Verified(Box::new(result)),
-        };
+        let event = next_loop_event(&shutdown, &mut interval, &mut monitor, &mut verified_rx).await;
         match event {
             LoopEvent::Shutdown => break,
             LoopEvent::Refresh => {
-                if outputs.refresh(&config).await {
+                let changes = outputs.refresh(&config).await;
+                if changes.lastfm {
+                    lastfm_tracker.reset();
+                }
+                if changes.any {
                     // Re-evaluate the still-playing track so enabling or fixing an
                     // output does not require the user to change tracks.
                     active = None;
@@ -192,6 +221,18 @@ async fn run_loop(
                     Ok(players) => {
                         let allowlist = config.read().await.players.allowlist.clone();
                         let selected = select_player(&players, &allowlist).cloned();
+                        let now = Instant::now();
+                        let actions = if outputs.lastfm.is_some() {
+                            if selected.is_some() {
+                                lastfm_tracker.observe(selected.as_ref(), now)
+                            } else {
+                                lastfm_tracker.pause(now)
+                            }
+                        } else {
+                            lastfm_tracker.reset();
+                            Vec::new()
+                        };
+                        outputs.submit_lastfm(actions);
                         let next = selected.as_ref().and_then(|player| {
                             player
                                 .track
@@ -204,6 +245,7 @@ async fn run_loop(
                             selected.as_ref(),
                             outputs.mqtt.as_ref(),
                             outputs.webhook.as_ref(),
+                            outputs.lastfm.as_ref(),
                         )
                         .await;
                         if next != active {
@@ -229,9 +271,35 @@ async fn run_loop(
                 }
             }
             LoopEvent::Verified(result) => {
-                handle_verified(*result, generation, &config, &state, &mut outputs).await;
+                handle_verified(
+                    *result,
+                    generation,
+                    &config,
+                    &state,
+                    &mut outputs,
+                    &mut lastfm_tracker,
+                )
+                .await;
             }
         }
+    }
+}
+
+async fn next_loop_event(
+    shutdown: &CancellationToken,
+    interval: &mut tokio::time::Interval,
+    monitor: &mut MprisMonitor,
+    verified_rx: &mut mpsc::Receiver<VerifiedResult>,
+) -> LoopEvent {
+    tokio::select! {
+        () = shutdown.cancelled() => LoopEvent::Shutdown,
+        _ = interval.tick() => LoopEvent::Refresh,
+        () = monitor.changed() => {
+            // Players often emit title, artist, album, and length separately.
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            LoopEvent::Refresh
+        }
+        Some(result) = verified_rx.recv() => LoopEvent::Verified(Box::new(result)),
     }
 }
 
@@ -241,6 +309,7 @@ async fn update_state(
     selected: Option<&Player>,
     mqtt: Option<&MqttPublisher>,
     webhook: Option<&WebhookPublisher>,
+    lastfm: Option<&LastFmPublisher>,
 ) {
     let mqtt_status = if let Some(mqtt) = mqtt {
         mqtt.status().await
@@ -252,12 +321,18 @@ async fn update_state(
     } else {
         WebhookStatus::default()
     };
+    let lastfm_status = if let Some(lastfm) = lastfm {
+        lastfm.status().await
+    } else {
+        LastFmStatus::default()
+    };
     let mut current = state.write().await;
     current.players = players;
     current.selected = selected.cloned();
     current.error = None;
     current.mqtt = mqtt_status;
     current.webhook = webhook_status;
+    current.lastfm = lastfm_status;
 }
 
 async fn handle_verified(
@@ -266,6 +341,7 @@ async fn handle_verified(
     config: &RwLock<Config>,
     state: &RwLock<RuntimeState>,
     outputs: &mut Outputs,
+    lastfm_tracker: &mut PlaybackTracker,
 ) {
     if result.generation != generation {
         return;
@@ -281,8 +357,10 @@ async fn handle_verified(
                     | VerificationStatus::Unavailable
             ));
     if eligible && let Some(track) = &result.player.track {
-        let message = NowPlayingMessage::new(&result.player, track, result.verification);
+        let message = NowPlayingMessage::new(&result.player, track, result.verification.clone());
         outputs.publish(&result.player, message);
+        let actions = lastfm_tracker.authorize(&result.player, result.verification, Instant::now());
+        outputs.submit_lastfm(actions);
     }
 }
 

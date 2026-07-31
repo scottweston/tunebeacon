@@ -24,3 +24,14 @@ enabled = false
 url = "https://example.com/hooks/now-playing"
 # Optional Authorization: Bearer header. Masked in the TUI.
 bearer_token = ""
+
+[lastfm]
+enabled = false
+# Create an API account at https://www.last.fm/api/account/create, enter its
+# application credentials here, then press "a" on the Last.fm TUI tab.
+api_key = ""
+shared_secret = ""
+# Filled after browser authorization. The shared secret and session key are
+# masked in the TUI.
+session_key = ""
+username = ""

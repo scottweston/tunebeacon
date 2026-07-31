@@ -27,6 +27,7 @@ use crate::{
     artwork::cached_artwork,
     config::Config,
     domain::PlaybackStatus,
+    lastfm::{self, Authorization},
     mqtt,
     runtime::{Runtime, RuntimeState},
     webhook,
@@ -38,15 +39,17 @@ enum Tab {
     Players,
     Mqtt,
     Webhook,
+    LastFm,
     Verification,
 }
 
 impl Tab {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::NowPlaying,
         Self::Players,
         Self::Mqtt,
         Self::Webhook,
+        Self::LastFm,
         Self::Verification,
     ];
 
@@ -56,7 +59,8 @@ impl Tab {
             Self::Players => 1,
             Self::Mqtt => 2,
             Self::Webhook => 3,
-            Self::Verification => 4,
+            Self::LastFm => 4,
+            Self::Verification => 5,
         }
     }
 }
@@ -79,6 +83,9 @@ struct App {
     mqtt_input: Input,
     webhook_field: usize,
     webhook_input: Input,
+    lastfm_field: usize,
+    lastfm_input: Input,
+    lastfm_authorization: Option<Authorization>,
     editing: bool,
     message: String,
     message_expires_at: Option<Instant>,
@@ -121,6 +128,9 @@ pub async fn run(config: Config, config_path: PathBuf, cache_dir: PathBuf) -> Re
         mqtt_input: Input::default(),
         webhook_field: 0,
         webhook_input: Input::default(),
+        lastfm_field: 0,
+        lastfm_input: Input::default(),
+        lastfm_authorization: None,
         editing: false,
         message: String::new(),
         message_expires_at: None,
@@ -197,6 +207,14 @@ impl App {
                             }
                             changed
                         }
+                        Tab::LastFm => {
+                            let changed =
+                                self.lastfm_input.handle_event(&Event::Key(key)).is_some();
+                            if changed {
+                                self.apply_lastfm_input();
+                            }
+                            changed
+                        }
                         _ => false,
                     };
                     if changed {
@@ -214,14 +232,16 @@ impl App {
             KeyCode::Char('2') => self.tab = Tab::Players,
             KeyCode::Char('3') => self.tab = Tab::Mqtt,
             KeyCode::Char('4') => self.tab = Tab::Webhook,
-            KeyCode::Char('5') => self.tab = Tab::Verification,
-            KeyCode::Left => self.tab = Tab::ALL[(self.tab.index() + 4) % 5],
-            KeyCode::Right => self.tab = Tab::ALL[(self.tab.index() + 1) % 5],
+            KeyCode::Char('5') => self.tab = Tab::LastFm,
+            KeyCode::Char('6') => self.tab = Tab::Verification,
+            KeyCode::Left => self.tab = Tab::ALL[(self.tab.index() + 5) % 6],
+            KeyCode::Right => self.tab = Tab::ALL[(self.tab.index() + 1) % 6],
             KeyCode::Char('s') => self.save()?,
             _ => match self.tab {
                 Tab::Players => self.handle_player_key(key).await,
                 Tab::Mqtt => self.handle_mqtt_key(key).await?,
                 Tab::Webhook => self.handle_webhook_key(key).await?,
+                Tab::LastFm => self.handle_lastfm_key(key).await?,
                 Tab::Verification => {
                     if matches!(key.code, KeyCode::Char('f' | ' ')) {
                         self.config.verification.publish_unverified =
@@ -376,6 +396,99 @@ impl App {
         }
     }
 
+    async fn handle_lastfm_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Up => self.lastfm_field = self.lastfm_field.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => {
+                self.lastfm_field = (self.lastfm_field + 1).min(2);
+            }
+            KeyCode::Enter => {
+                self.editing = true;
+                self.lastfm_input = Input::from(self.lastfm_field_value());
+            }
+            KeyCode::Char('e') => {
+                self.config.lastfm.enabled = !self.config.lastfm.enabled;
+                self.sync_config().await;
+            }
+            KeyCode::Char('d') => {
+                self.config.lastfm.enabled = false;
+                self.config.lastfm.session_key.clear();
+                self.config.lastfm.username.clear();
+                self.lastfm_authorization = None;
+                self.sync_config().await;
+                self.show_message("Last.fm account disconnected", Duration::from_secs(3));
+            }
+            KeyCode::Char('a') => self.authorize_lastfm().await,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn lastfm_field_value(&self) -> String {
+        match self.lastfm_field {
+            0 => self.config.lastfm.api_key.clone(),
+            1 => self.config.lastfm.shared_secret.clone(),
+            2 => self.config.lastfm.session_key.clone(),
+            _ => String::new(),
+        }
+    }
+
+    fn apply_lastfm_input(&mut self) {
+        let value = self.lastfm_input.value().to_owned();
+        match self.lastfm_field {
+            0 => self.config.lastfm.api_key = value,
+            1 => self.config.lastfm.shared_secret = value,
+            2 => self.config.lastfm.session_key = value,
+            _ => {}
+        }
+    }
+
+    async fn authorize_lastfm(&mut self) {
+        if let Some(authorization) = &self.lastfm_authorization {
+            let token = authorization.token.clone();
+            match lastfm::complete_authorization(&self.config.lastfm, &token).await {
+                Ok(session) => {
+                    self.config.lastfm.username = session.username;
+                    self.config.lastfm.session_key = session.session_key;
+                    self.config.lastfm.enabled = true;
+                    self.lastfm_authorization = None;
+                    self.sync_config().await;
+                    self.show_message(
+                        format!("Authorized Last.fm account {}", self.config.lastfm.username),
+                        Duration::from_secs(4),
+                    );
+                }
+                Err(error) => {
+                    self.show_message(
+                        format!("Last.fm authorization failed: {error:#}"),
+                        Duration::from_secs(6),
+                    );
+                }
+            }
+            return;
+        }
+
+        match lastfm::begin_authorization(&self.config.lastfm).await {
+            Ok(authorization) => {
+                let url = authorization.url.clone();
+                drop(tokio::task::spawn_blocking(move || {
+                    std::process::Command::new("xdg-open").arg(url).status()
+                }));
+                self.lastfm_authorization = Some(authorization);
+                self.show_message(
+                    "Approve TuneBeacon in the browser, then press a again",
+                    Duration::from_secs(6),
+                );
+            }
+            Err(error) => {
+                self.show_message(
+                    format!("Could not start Last.fm authorization: {error:#}"),
+                    Duration::from_secs(6),
+                );
+            }
+        }
+    }
+
     fn move_priority(&mut self, direction: isize) {
         let Some(player) = self.state.players.get(self.player_cursor) else {
             return;
@@ -527,10 +640,17 @@ impl App {
         ])
         .split(frame.area());
         frame.render_widget(
-            Tabs::new(["Now playing", "Players", "MQTT", "Webhook", "Verification"])
-                .select(self.tab.index())
-                .block(Block::bordered().title(" TuneBeacon "))
-                .highlight_style(Style::default().fg(Color::Cyan).bold()),
+            Tabs::new([
+                "Now playing",
+                "Players",
+                "MQTT",
+                "Webhook",
+                "Last.fm",
+                "Verification",
+            ])
+            .select(self.tab.index())
+            .block(Block::bordered().title(" TuneBeacon "))
+            .highlight_style(Style::default().fg(Color::Cyan).bold()),
             areas[0],
         );
         match self.tab {
@@ -538,10 +658,11 @@ impl App {
             Tab::Players => self.draw_players(frame, areas[1]),
             Tab::Mqtt => self.draw_mqtt(frame, areas[1]),
             Tab::Webhook => self.draw_webhook(frame, areas[1]),
+            Tab::LastFm => self.draw_lastfm(frame, areas[1]),
             Tab::Verification => self.draw_verification(frame, areas[1]),
         }
         let footer = if self.message.is_empty() {
-            "1–5/←→ tabs  s save  q quit"
+            "1–6/←→ tabs  s save  q quit"
         } else {
             &self.message
         };
@@ -611,6 +732,14 @@ impl App {
                         "delivered"
                     } else if self.config.webhook.enabled {
                         &self.state.webhook.detail
+                    } else {
+                        "disabled"
+                    },
+                ),
+                detail(
+                    "Last.fm",
+                    if self.config.lastfm.enabled {
+                        &self.state.lastfm.detail
                     } else {
                         "disabled"
                     },
@@ -860,6 +989,75 @@ impl App {
         }
     }
 
+    fn draw_lastfm(&self, frame: &mut Frame, area: Rect) {
+        let block = Block::bordered().title(" Last.fm scrobbling ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.is_empty() {
+            return;
+        }
+        let account = if self.config.lastfm.username.is_empty() {
+            "not authorized"
+        } else {
+            self.config.lastfm.username.as_str()
+        };
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Enabled: {}   Account: {}   Status: {}",
+                yes_no(self.config.lastfm.enabled),
+                account,
+                if self.config.lastfm.enabled {
+                    self.state.lastfm.detail.as_str()
+                } else {
+                    "disabled"
+                }
+            )),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+
+        let values = [
+            ("API key", self.config.lastfm.api_key.clone()),
+            ("Secret", self.config.lastfm.shared_secret.clone()),
+            ("Session", self.config.lastfm.session_key.clone()),
+        ];
+        for (index, (label, configured_value)) in values.into_iter().enumerate() {
+            self.draw_input_field(
+                frame,
+                inner,
+                index,
+                self.lastfm_field,
+                label,
+                &configured_value,
+                index > 0,
+                &self.lastfm_input,
+            );
+        }
+
+        let auth_y = inner.y.saturating_add(6);
+        if auth_y < inner.bottom() {
+            let authorization = self.lastfm_authorization.as_ref().map_or_else(
+                || "Enter an API key and shared secret, then press a to authorize.".to_owned(),
+                |authorization| format!("Authorize at {} then press a again.", authorization.url),
+            );
+            frame.render_widget(
+                Paragraph::new(authorization).wrap(Wrap { trim: true }),
+                Rect::new(
+                    inner.x,
+                    auth_y,
+                    inner.width,
+                    inner.bottom().saturating_sub(auth_y).min(3),
+                ),
+            );
+        }
+        let help_y = inner.bottom().saturating_sub(1);
+        if help_y >= inner.y {
+            frame.render_widget(
+                Paragraph::new("↑/↓ field  Enter edit  a authorize/finish  e enable  d disconnect"),
+                Rect::new(inner.x, help_y, inner.width, 1),
+            );
+        }
+    }
+
     fn draw_verification(&self, frame: &mut Frame, area: Rect) {
         let (mode, mode_style) = if self.config.verification.publish_unverified {
             (
@@ -911,6 +1109,8 @@ mod tests {
         let mut config = Config::default();
         config.mqtt.password = Some("do-not-render-this".to_owned());
         config.webhook.bearer_token = Some("do-not-render-token".to_owned());
+        config.lastfm.shared_secret = "do-not-render-secret".to_owned();
+        config.lastfm.session_key = "do-not-render-session".to_owned();
         let (artwork_sender, artwork_results) = tokio::sync::mpsc::unbounded_channel();
         let (encoding_sender, encoding_results) = tokio::sync::mpsc::unbounded_channel();
         App {
@@ -926,6 +1126,9 @@ mod tests {
             mqtt_input: Input::default(),
             webhook_field: 0,
             webhook_input: Input::default(),
+            lastfm_field: 0,
+            lastfm_input: Input::default(),
+            lastfm_authorization: None,
             editing: false,
             message: String::new(),
             message_expires_at: None,
@@ -986,6 +1189,14 @@ mod tests {
         assert!(rendered.contains("••••"));
         let selected_blank = terminal.backend().buffer().cell((20, 6)).unwrap();
         assert!(selected_blank.modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn lastfm_layout_masks_shared_secret_and_session_key() {
+        let rendered = render(100, 24, app(Tab::LastFm));
+        assert!(!rendered.contains("do-not-render-secret"));
+        assert!(!rendered.contains("do-not-render-session"));
+        assert!(rendered.contains("••••"));
     }
 
     #[tokio::test]

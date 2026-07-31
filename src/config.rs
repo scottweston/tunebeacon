@@ -19,6 +19,7 @@ pub struct Config {
     pub verification: VerificationConfig,
     pub mqtt: MqttConfig,
     pub webhook: WebhookConfig,
+    pub lastfm: LastFmConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -57,6 +58,16 @@ pub struct WebhookConfig {
     pub bearer_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct LastFmConfig {
+    pub enabled: bool,
+    pub api_key: String,
+    pub shared_secret: String,
+    pub session_key: String,
+    pub username: String,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -65,6 +76,7 @@ impl Default for Config {
             verification: VerificationConfig::default(),
             mqtt: MqttConfig::default(),
             webhook: WebhookConfig::default(),
+            lastfm: LastFmConfig::default(),
         }
     }
 }
@@ -139,8 +151,8 @@ impl Config {
     /// incomplete.
     pub fn validate_daemon(&self) -> Result<()> {
         self.validate()?;
-        if !self.mqtt.enabled && !self.webhook.enabled {
-            bail!("daemon mode requires MQTT, webhook, or both to be enabled");
+        if !self.mqtt.enabled && !self.webhook.enabled && !self.lastfm.enabled {
+            bail!("daemon mode requires MQTT, webhook, or Last.fm to be enabled");
         }
         if self.mqtt.enabled {
             if self.mqtt.host.trim().is_empty() {
@@ -155,6 +167,9 @@ impl Config {
         }
         if self.webhook.enabled {
             validate_webhook_url(&self.webhook.url)?;
+        }
+        if self.lastfm.enabled {
+            validate_lastfm(&self.lastfm)?;
         }
         Ok(())
     }
@@ -199,6 +214,24 @@ impl Config {
             .with_context(|| format!("failed to replace {}", path.display()))?;
         Ok(())
     }
+}
+
+/// Validate the credentials required for authenticated Last.fm calls.
+///
+/// # Errors
+///
+/// Returns an error when any application or session credential is missing.
+pub fn validate_lastfm(config: &LastFmConfig) -> Result<()> {
+    if config.api_key.trim().is_empty() {
+        bail!("lastfm.api_key must be configured");
+    }
+    if config.shared_secret.trim().is_empty() {
+        bail!("lastfm.shared_secret must be configured");
+    }
+    if config.session_key.trim().is_empty() {
+        bail!("lastfm.session_key must be authorized");
+    }
+    Ok(())
 }
 
 /// Validate a webhook URL and require an HTTP transport.
