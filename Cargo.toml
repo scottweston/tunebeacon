@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Privacy-first MPRIS now-playing delivery over MQTT and webhooks"
 license = "MIT"
+repository = "https://github.com/scottweston/tunebeacon"
 
 [dependencies]
 anyhow = "1.0"
@@ -40,6 +41,11 @@ tempfile = "3.20"
 lto = true
 strip = true
 codegen-units = 1
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 [lints.rust]
 unsafe_code = "forbid"
