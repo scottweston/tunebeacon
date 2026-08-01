@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, List, ListItem, Paragraph, Tabs, Wrap},
+    widgets::{Block, Clear, List, ListItem, Paragraph, Tabs, Wrap},
 };
 use ratatui_image::{
     StatefulImage,
@@ -70,9 +70,21 @@ struct ArtworkState {
     requests: UnboundedReceiver<ResizeRequest>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum Dialog {
+    ReviewChanges,
+    ConfirmQuit,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ConfigurationChange {
+    description: String,
+}
+
 struct App {
     tab: Tab,
     config: Config,
+    saved_config: Config,
     config_path: PathBuf,
     cache_dir: PathBuf,
     runtime_config: Arc<RwLock<Config>>,
@@ -87,6 +99,8 @@ struct App {
     lastfm_input: Input,
     lastfm_authorization: Option<Authorization>,
     editing: bool,
+    dialog: Option<Dialog>,
+    changes_scroll: u16,
     message: String,
     message_expires_at: Option<Instant>,
     artwork_url: Option<String>,
@@ -117,6 +131,7 @@ pub async fn run(config: Config, config_path: PathBuf, cache_dir: PathBuf) -> Re
     let terminal = ratatui::init();
     let result = App {
         tab: Tab::NowPlaying,
+        saved_config: config.clone(),
         config,
         config_path,
         cache_dir,
@@ -132,6 +147,8 @@ pub async fn run(config: Config, config_path: PathBuf, cache_dir: PathBuf) -> Re
         lastfm_input: Input::default(),
         lastfm_authorization: None,
         editing: false,
+        dialog: None,
+        changes_scroll: 0,
         message: String::new(),
         message_expires_at: None,
         artwork_url: None,
@@ -172,7 +189,9 @@ impl App {
                 }
                 result = tokio::signal::ctrl_c() => {
                     result?;
-                    break;
+                    if self.request_quit() {
+                        break;
+                    }
                 }
             }
         }
@@ -180,6 +199,12 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Ok(self.request_quit());
+        }
+        if let Some(dialog) = self.dialog {
+            return self.handle_dialog_key(dialog, key);
+        }
         if self.editing {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => {
@@ -225,7 +250,7 @@ impl App {
             return Ok(false);
         }
         if matches!(key.code, KeyCode::Char('q')) {
-            return Ok(true);
+            return Ok(self.request_quit());
         }
         match key.code {
             KeyCode::Char('1') => self.tab = Tab::NowPlaying,
@@ -237,6 +262,7 @@ impl App {
             KeyCode::Left => self.tab = Tab::ALL[(self.tab.index() + 5) % 6],
             KeyCode::Right => self.tab = Tab::ALL[(self.tab.index() + 1) % 6],
             KeyCode::Char('s') => self.save()?,
+            KeyCode::Char('v') if self.is_dirty() => self.open_dialog(Dialog::ReviewChanges),
             _ => match self.tab {
                 Tab::Players => self.handle_player_key(key).await,
                 Tab::Mqtt => self.handle_mqtt_key(key).await?,
@@ -255,6 +281,53 @@ impl App {
         Ok(false)
     }
 
+    fn handle_dialog_key(&mut self, dialog: Dialog, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Up => self.changes_scroll = self.changes_scroll.saturating_sub(1),
+            KeyCode::Down => self.changes_scroll = self.changes_scroll.saturating_add(1),
+            KeyCode::Esc => self.dialog = None,
+            KeyCode::Char('s') => {
+                self.save()?;
+                if dialog == Dialog::ConfirmQuit {
+                    return Ok(true);
+                }
+                self.dialog = None;
+            }
+            KeyCode::Char('i') if dialog == Dialog::ConfirmQuit => return Ok(true),
+            KeyCode::Char('q') if dialog == Dialog::ReviewChanges => {
+                self.open_dialog(Dialog::ConfirmQuit);
+            }
+            KeyCode::Char('v') | KeyCode::Enter if dialog == Dialog::ReviewChanges => {
+                self.dialog = None;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn request_quit(&mut self) -> bool {
+        self.editing = false;
+        if self.is_dirty() {
+            self.open_dialog(Dialog::ConfirmQuit);
+            false
+        } else {
+            true
+        }
+    }
+
+    fn open_dialog(&mut self, dialog: Dialog) {
+        self.dialog = Some(dialog);
+        self.changes_scroll = 0;
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.config != self.saved_config
+    }
+
+    fn configuration_changes(&self) -> Vec<ConfigurationChange> {
+        configuration_changes(&self.saved_config, &self.config)
+    }
+
     async fn handle_player_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -268,26 +341,54 @@ impl App {
             KeyCode::Up => self.player_cursor = self.player_cursor.saturating_sub(1),
             KeyCode::Down => {
                 self.player_cursor =
-                    (self.player_cursor + 1).min(self.state.players.len().saturating_sub(1));
+                    (self.player_cursor + 1).min(self.player_row_keys().len().saturating_sub(1));
             }
             KeyCode::Char(' ' | 'a') => {
-                if let Some(player) = self.state.players.get(self.player_cursor) {
-                    if let Some(index) = self
-                        .config
+                let Some(key) = self.player_row_keys().get(self.player_cursor).cloned() else {
+                    return;
+                };
+                if self
+                    .config
+                    .players
+                    .allowlist
+                    .iter()
+                    .any(|allowed| allowed == &key)
+                {
+                    self.config
                         .players
                         .allowlist
-                        .iter()
-                        .position(|key| key == &player.key)
-                    {
-                        self.config.players.allowlist.remove(index);
-                    } else {
-                        self.config.players.allowlist.push(player.key.clone());
-                    }
-                    self.sync_config().await;
+                        .retain(|allowed| allowed != &key);
+                } else {
+                    self.config.players.allowlist.push(key.clone());
                 }
+                self.follow_or_clamp_player_cursor(&key);
+                self.sync_config().await;
             }
             _ => {}
         }
+    }
+
+    fn player_row_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        for key in &self.config.players.allowlist {
+            if !keys.contains(key) {
+                keys.push(key.clone());
+            }
+        }
+        for player in &self.state.players {
+            if !keys.contains(&player.key) {
+                keys.push(player.key.clone());
+            }
+        }
+        keys
+    }
+
+    fn follow_or_clamp_player_cursor(&mut self, selected_key: &str) {
+        let keys = self.player_row_keys();
+        self.player_cursor = keys
+            .iter()
+            .position(|key| key == selected_key)
+            .unwrap_or_else(|| self.player_cursor.min(keys.len().saturating_sub(1)));
     }
 
     async fn handle_mqtt_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -341,8 +442,8 @@ impl App {
         let value = self.mqtt_input.value().to_owned();
         match self.mqtt_field {
             0 => self.config.mqtt.host = value,
-            1 => self.config.mqtt.username = Some(value),
-            2 => self.config.mqtt.password = Some(value),
+            1 => self.config.mqtt.username = optional_value(value),
+            2 => self.config.mqtt.password = optional_value(value),
             3 => self.config.mqtt.topic = value,
             4 => {
                 if let Ok(port) = value.parse::<u16>() {
@@ -391,7 +492,7 @@ impl App {
         let value = self.webhook_input.value().to_owned();
         match self.webhook_field {
             0 => self.config.webhook.url = value,
-            1 => self.config.webhook.bearer_token = Some(value),
+            1 => self.config.webhook.bearer_token = optional_value(value),
             _ => {}
         }
     }
@@ -490,7 +591,7 @@ impl App {
     }
 
     fn move_priority(&mut self, direction: isize) {
-        let Some(player) = self.state.players.get(self.player_cursor) else {
+        let Some(key) = self.player_row_keys().get(self.player_cursor).cloned() else {
             return;
         };
         let Some(index) = self
@@ -498,13 +599,14 @@ impl App {
             .players
             .allowlist
             .iter()
-            .position(|key| key == &player.key)
+            .position(|allowed| allowed == &key)
         else {
             return;
         };
         let target = index.saturating_add_signed(direction);
         if target < self.config.players.allowlist.len() {
             self.config.players.allowlist.swap(index, target);
+            self.follow_or_clamp_player_cursor(&key);
         }
     }
 
@@ -514,6 +616,7 @@ impl App {
 
     fn save(&mut self) -> Result<()> {
         self.config.save(&self.config_path)?;
+        self.saved_config.clone_from(&self.config);
         self.show_message(
             format!("saved {}", self.config_path.display()),
             Duration::from_secs(2),
@@ -639,6 +742,18 @@ impl App {
             Constraint::Length(2),
         ])
         .split(frame.area());
+        let change_count = self.configuration_changes().len();
+        let title = if change_count == 0 {
+            Line::from(" TuneBeacon ")
+        } else {
+            Line::from(vec![
+                Span::raw(" TuneBeacon "),
+                Span::styled(
+                    format!("• {change_count} UNSAVED "),
+                    Style::default().fg(Color::Yellow).bold(),
+                ),
+            ])
+        };
         frame.render_widget(
             Tabs::new([
                 "Now playing",
@@ -649,7 +764,7 @@ impl App {
                 "Verification",
             ])
             .select(self.tab.index())
-            .block(Block::bordered().title(" TuneBeacon "))
+            .block(Block::bordered().title(title))
             .highlight_style(Style::default().fg(Color::Cyan).bold()),
             areas[0],
         );
@@ -661,16 +776,66 @@ impl App {
             Tab::LastFm => self.draw_lastfm(frame, areas[1]),
             Tab::Verification => self.draw_verification(frame, areas[1]),
         }
-        let footer = if self.message.is_empty() {
-            "1–6/←→ tabs  s save  q quit"
+        let footer = if change_count > 0 {
+            Line::from(vec![
+                Span::styled(
+                    format!("● {change_count} unsaved change(s)"),
+                    Style::default().fg(Color::Yellow).bold(),
+                ),
+                Span::raw("  v review  s save  q quit"),
+            ])
+        } else if self.message.is_empty() {
+            Line::from("1–6/←→ tabs  s save  q quit")
         } else {
-            &self.message
+            Line::from(self.message.clone())
         };
         frame.render_widget(
             Paragraph::new(footer)
                 .style(Style::default().fg(Color::DarkGray))
                 .alignment(Alignment::Center),
             areas[2],
+        );
+        if let Some(dialog) = self.dialog {
+            self.draw_changes_dialog(frame, dialog);
+        }
+    }
+
+    fn draw_changes_dialog(&self, frame: &mut Frame, dialog: Dialog) {
+        let area = centered_dialog(frame.area());
+        frame.render_widget(Clear, area);
+        let changes = self.configuration_changes();
+        let title = match dialog {
+            Dialog::ReviewChanges => format!(" Unsaved configuration changes ({}) ", changes.len()),
+            Dialog::ConfirmQuit => format!(" Save before quitting? ({} changes) ", changes.len()),
+        };
+        let block = Block::bordered()
+            .title(title)
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.is_empty() {
+            return;
+        }
+        let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
+        let lines = changes
+            .into_iter()
+            .map(|change| Line::from(format!("• {}", change.description)))
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((self.changes_scroll, 0)),
+            sections[0],
+        );
+        let prompt = match dialog {
+            Dialog::ReviewChanges => "↑/↓ scroll   s save   q quit   Esc/v close",
+            Dialog::ConfirmQuit => "s save & quit   i ignore & quit   Esc cancel",
+        };
+        frame.render_widget(
+            Paragraph::new(prompt)
+                .style(Style::default().fg(Color::Yellow).bold())
+                .alignment(Alignment::Center),
+            sections[1],
         );
     }
 
@@ -760,49 +925,55 @@ impl App {
     }
 
     fn draw_players(&self, frame: &mut Frame, area: Rect) {
-        let items = if self.state.players.is_empty() {
+        let player_keys = self.player_row_keys();
+        let items = if player_keys.is_empty() {
             vec![ListItem::new(
-                "No MPRIS players discovered in this D-Bus session.",
+                "No MPRIS players are configured or discovered in this D-Bus session.",
             )]
         } else {
-            self.state
-                .players
+            player_keys
                 .iter()
                 .enumerate()
-                .map(|(index, player)| {
+                .map(|(index, key)| {
+                    let player = self.state.players.iter().find(|player| &player.key == key);
                     let priority = self
                         .config
                         .players
                         .allowlist
                         .iter()
-                        .position(|key| key == &player.key);
+                        .position(|allowed| allowed == key);
                     let allowed = priority.map_or_else(
                         || "[ ] denied".to_owned(),
                         |value| format!("[✓] priority {}", value + 1),
                     );
-                    let status = match player.status {
-                        PlaybackStatus::Playing => "playing",
-                        PlaybackStatus::Paused => "paused",
-                        PlaybackStatus::Stopped => "stopped",
-                        PlaybackStatus::Unknown => "unknown",
+                    let (status, identity) = match player {
+                        Some(player) => (
+                            match player.status {
+                                PlaybackStatus::Playing => "playing",
+                                PlaybackStatus::Paused => "paused",
+                                PlaybackStatus::Stopped => "stopped",
+                                PlaybackStatus::Unknown => "unknown",
+                            },
+                            player.identity.as_str(),
+                        ),
+                        None => ("offline", "not currently discovered"),
                     };
                     let style = if index == self.player_cursor {
                         Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else if player.is_none() {
+                        Style::default().fg(Color::DarkGray)
                     } else {
                         Style::default()
                     };
-                    ListItem::new(format!(
-                        "{allowed:>14}  {:<20} {:<10} {}",
-                        player.key, status, player.identity
-                    ))
-                    .style(style)
+                    ListItem::new(format!("{allowed:>14}  {key:<20} {status:<10} {identity}"))
+                        .style(style)
                 })
                 .collect()
         };
         frame.render_widget(
             List::new(items).block(
                 Block::bordered()
-                    .title(" Discovered players — ↑/↓ select, Space allow, Shift+↑/↓ priority "),
+                    .title(" Players — ↑/↓ select, Space allow/deny, Shift+↑/↓ priority "),
             ),
             area,
         );
@@ -1088,6 +1259,250 @@ impl App {
     }
 }
 
+fn centered_dialog(area: Rect) -> Rect {
+    let width = area.width.saturating_sub(4).min(100);
+    let height = area.height.saturating_sub(2).min(26);
+    Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    )
+}
+
+fn optional_value(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn configuration_changes(saved: &Config, current: &Config) -> Vec<ConfigurationChange> {
+    let mut changes = Vec::new();
+    general_configuration_changes(&mut changes, saved, current);
+    mqtt_configuration_changes(&mut changes, saved, current);
+    webhook_configuration_changes(&mut changes, saved, current);
+    lastfm_configuration_changes(&mut changes, saved, current);
+    changes
+}
+
+fn general_configuration_changes(
+    changes: &mut Vec<ConfigurationChange>,
+    saved: &Config,
+    current: &Config,
+) {
+    push_change(
+        changes,
+        "Configuration version",
+        &saved.version,
+        &current.version,
+        ToString::to_string,
+    );
+    push_change(
+        changes,
+        "Players allowlist",
+        &saved.players.allowlist,
+        &current.players.allowlist,
+        |players| {
+            if players.is_empty() {
+                "none".to_owned()
+            } else {
+                players.join(", ")
+            }
+        },
+    );
+    push_change(
+        changes,
+        "Verification publish unverified",
+        &saved.verification.publish_unverified,
+        &current.verification.publish_unverified,
+        |value| enabled_disabled(*value),
+    );
+}
+
+fn mqtt_configuration_changes(
+    changes: &mut Vec<ConfigurationChange>,
+    saved: &Config,
+    current: &Config,
+) {
+    push_change(
+        changes,
+        "MQTT enabled",
+        &saved.mqtt.enabled,
+        &current.mqtt.enabled,
+        |value| enabled_disabled(*value),
+    );
+    push_change(
+        changes,
+        "MQTT host",
+        &saved.mqtt.host,
+        &current.mqtt.host,
+        display_string,
+    );
+    push_change(
+        changes,
+        "MQTT port",
+        &saved.mqtt.port,
+        &current.mqtt.port,
+        ToString::to_string,
+    );
+    push_change(
+        changes,
+        "MQTT TLS",
+        &saved.mqtt.tls,
+        &current.mqtt.tls,
+        |value| enabled_disabled(*value),
+    );
+    push_change(
+        changes,
+        "MQTT username",
+        &saved.mqtt.username,
+        &current.mqtt.username,
+        |value| display_optional_string(value.as_ref()),
+    );
+    push_secret_change(
+        changes,
+        "MQTT password",
+        saved.mqtt.password.as_deref(),
+        current.mqtt.password.as_deref(),
+    );
+    push_change(
+        changes,
+        "MQTT topic",
+        &saved.mqtt.topic,
+        &current.mqtt.topic,
+        display_string,
+    );
+    push_change(
+        changes,
+        "MQTT QoS",
+        &saved.mqtt.qos,
+        &current.mqtt.qos,
+        ToString::to_string,
+    );
+    push_change(
+        changes,
+        "MQTT retain",
+        &saved.mqtt.retain,
+        &current.mqtt.retain,
+        |value| enabled_disabled(*value),
+    );
+}
+
+fn webhook_configuration_changes(
+    changes: &mut Vec<ConfigurationChange>,
+    saved: &Config,
+    current: &Config,
+) {
+    push_change(
+        changes,
+        "Webhook enabled",
+        &saved.webhook.enabled,
+        &current.webhook.enabled,
+        |value| enabled_disabled(*value),
+    );
+    push_change(
+        changes,
+        "Webhook URL",
+        &saved.webhook.url,
+        &current.webhook.url,
+        display_string,
+    );
+    push_secret_change(
+        changes,
+        "Webhook bearer token",
+        saved.webhook.bearer_token.as_deref(),
+        current.webhook.bearer_token.as_deref(),
+    );
+}
+
+fn lastfm_configuration_changes(
+    changes: &mut Vec<ConfigurationChange>,
+    saved: &Config,
+    current: &Config,
+) {
+    push_change(
+        changes,
+        "Last.fm enabled",
+        &saved.lastfm.enabled,
+        &current.lastfm.enabled,
+        |value| enabled_disabled(*value),
+    );
+    push_change(
+        changes,
+        "Last.fm API key",
+        &saved.lastfm.api_key,
+        &current.lastfm.api_key,
+        display_string,
+    );
+    push_secret_change(
+        changes,
+        "Last.fm shared secret",
+        Some(&saved.lastfm.shared_secret),
+        Some(&current.lastfm.shared_secret),
+    );
+    push_secret_change(
+        changes,
+        "Last.fm session key",
+        Some(&saved.lastfm.session_key),
+        Some(&current.lastfm.session_key),
+    );
+    push_change(
+        changes,
+        "Last.fm username",
+        &saved.lastfm.username,
+        &current.lastfm.username,
+        display_string,
+    );
+}
+
+fn push_change<T: PartialEq>(
+    changes: &mut Vec<ConfigurationChange>,
+    label: &str,
+    saved: &T,
+    current: &T,
+    display: impl Fn(&T) -> String,
+) {
+    if saved != current {
+        changes.push(ConfigurationChange {
+            description: format!("{label}: {} → {}", display(saved), display(current)),
+        });
+    }
+}
+
+fn push_secret_change(
+    changes: &mut Vec<ConfigurationChange>,
+    label: &str,
+    saved: Option<&str>,
+    current: Option<&str>,
+) {
+    if saved == current {
+        return;
+    }
+    let saved_is_set = saved.is_some_and(|value| !value.is_empty());
+    let current_is_set = current.is_some_and(|value| !value.is_empty());
+    let description = match (saved_is_set, current_is_set) {
+        (false, true) => format!("{label}: not set → set (value hidden)"),
+        (true, false) => format!("{label}: set → not set (value hidden)"),
+        _ => format!("{label}: value changed (hidden)"),
+    };
+    changes.push(ConfigurationChange { description });
+}
+
+fn enabled_disabled(value: bool) -> String {
+    if value { "enabled" } else { "disabled" }.to_owned()
+}
+
+fn display_string(value: &String) -> String {
+    if value.is_empty() {
+        "(empty)".to_owned()
+    } else {
+        format!("“{value}”")
+    }
+}
+
+fn display_optional_string(value: Option<&String>) -> String {
+    value.map_or_else(|| "(not set)".to_owned(), display_string)
+}
+
 fn detail(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{label:>13}: "), Style::default().bold()),
@@ -1115,6 +1530,7 @@ mod tests {
         let (encoding_sender, encoding_results) = tokio::sync::mpsc::unbounded_channel();
         App {
             tab,
+            saved_config: config.clone(),
             config: config.clone(),
             config_path: PathBuf::from("/tmp/tunebeacon-test-config.toml"),
             cache_dir: PathBuf::from("/tmp/tunebeacon-test-cache"),
@@ -1130,6 +1546,8 @@ mod tests {
             lastfm_input: Input::default(),
             lastfm_authorization: None,
             editing: false,
+            dialog: None,
+            changes_scroll: 0,
             message: String::new(),
             message_expires_at: None,
             artwork_url: None,
@@ -1154,6 +1572,15 @@ mod tests {
             .collect()
     }
 
+    fn discovered_player(key: &str, status: PlaybackStatus) -> crate::domain::Player {
+        crate::domain::Player {
+            key: key.to_owned(),
+            identity: format!("{key} player"),
+            status,
+            ..crate::domain::Player::default()
+        }
+    }
+
     #[test]
     fn normal_and_narrow_layouts_render() {
         let normal = render(100, 30, app(Tab::NowPlaying));
@@ -1163,6 +1590,60 @@ mod tests {
         let narrow = render(45, 18, app(Tab::Verification));
         assert!(narrow.contains("Privacy mode"));
         assert!(narrow.contains("MusicBrainz"));
+    }
+
+    #[test]
+    fn players_layout_includes_configured_offline_players_in_priority_order() {
+        let mut app = app(Tab::Players);
+        app.config.players.allowlist = vec!["offline".to_owned(), "online".to_owned()];
+        app.state.players = vec![
+            discovered_player("denied", PlaybackStatus::Paused),
+            discovered_player("online", PlaybackStatus::Playing),
+        ];
+
+        let rendered = render(100, 24, app);
+        let offline = rendered.find("offline").unwrap();
+        let online = rendered.find("online").unwrap();
+        let denied = rendered.find("denied").unwrap();
+        assert!(offline < online);
+        assert!(online < denied);
+        assert!(rendered.contains("not currently discovered"));
+        assert!(rendered.contains("priority 1"));
+        assert!(rendered.contains("priority 2"));
+    }
+
+    #[tokio::test]
+    async fn offline_players_can_be_reprioritized_and_denied() {
+        let mut app = app(Tab::Players);
+        app.config.players.allowlist = vec!["first".to_owned(), "offline".to_owned()];
+        app.player_cursor = 1;
+
+        app.handle_player_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT))
+            .await;
+        assert_eq!(app.config.players.allowlist, ["offline", "first"]);
+        assert_eq!(app.player_cursor, 0);
+
+        app.handle_player_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.config.players.allowlist, ["first"]);
+        assert_eq!(app.player_row_keys(), ["first"]);
+    }
+
+    #[tokio::test]
+    async fn discovered_denied_player_moves_into_the_configured_list_when_allowed() {
+        let mut app = app(Tab::Players);
+        app.config.players.allowlist = vec!["configured-offline".to_owned()];
+        app.state.players = vec![discovered_player("discovered", PlaybackStatus::Stopped)];
+        app.player_cursor = 1;
+
+        app.handle_player_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .await;
+
+        assert_eq!(
+            app.config.players.allowlist,
+            ["configured-offline", "discovered"]
+        );
+        assert_eq!(app.player_cursor, 1);
     }
 
     #[test]
@@ -1265,5 +1746,88 @@ mod tests {
         app.expire_message();
         assert!(app.message.is_empty());
         assert!(app.message_expires_at.is_none());
+    }
+
+    #[test]
+    fn dirty_configuration_is_highlighted_and_reviewable() {
+        let mut app = app(Tab::Mqtt);
+        app.config.mqtt.host = "broker.example.test".to_owned();
+        app.config.mqtt.password = Some("new-password-must-stay-hidden".to_owned());
+        app.open_dialog(Dialog::ReviewChanges);
+
+        let rendered = render(100, 30, app);
+        assert!(rendered.contains("2 UNSAVED"));
+        assert!(rendered.contains("MQTT host"));
+        assert!(rendered.contains("broker.example.test"));
+        assert!(rendered.contains("MQTT password: value changed (hidden)"));
+        assert!(!rendered.contains("new-password-must-stay-hidden"));
+        assert!(!rendered.contains("do-not-render-this"));
+    }
+
+    #[tokio::test]
+    async fn quit_requires_an_explicit_dirty_configuration_choice() {
+        let mut app = app(Tab::Webhook);
+        app.config.webhook.enabled = true;
+
+        assert!(
+            !app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+                .await
+                .unwrap()
+        );
+        assert_eq!(app.dialog, Some(Dialog::ConfirmQuit));
+
+        assert!(
+            !app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .await
+                .unwrap()
+        );
+        assert_eq!(app.dialog, None);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn saving_refreshes_the_dirty_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app(Tab::Verification);
+        app.config_path = directory.path().join("config.toml");
+        app.config.verification.publish_unverified = true;
+        assert!(app.is_dirty());
+
+        app.save().unwrap();
+
+        assert!(!app.is_dirty());
+        assert_eq!(Config::load(&app.config_path).unwrap(), app.config);
+    }
+
+    #[tokio::test]
+    async fn clean_configuration_quits_without_a_prompt() {
+        let mut app = app(Tab::NowPlaying);
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+                .await
+                .unwrap()
+        );
+        assert_eq!(app.dialog, None);
+    }
+
+    #[tokio::test]
+    async fn control_c_uses_the_same_unsaved_changes_prompt() {
+        let mut app = app(Tab::Mqtt);
+        app.config.mqtt.tls = true;
+
+        assert!(
+            !app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL,))
+                .await
+                .unwrap()
+        );
+        assert_eq!(app.dialog, Some(Dialog::ConfirmQuit));
     }
 }

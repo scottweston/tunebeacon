@@ -50,7 +50,8 @@ permissions. Cached verification results and artwork live under
 The TUI keys are shown in context. The main controls are:
 
 - `1`–`6` or arrow keys: switch views.
-- Players: `Space` allows/denies; `Shift+Up/Down` changes priority.
+- Players: configured players remain listed when offline. `Space` allows/denies;
+  `Shift+Up/Down` changes priority.
 - MQTT: `Up/Down` selects a field and `Enter` edits it; input supports normal
   cursor, Home/End, Delete/Backspace, and word movement. `e` enables MQTT,
   `l` toggles TLS, `o` changes QoS, `r` toggles retain, and `c` tests the
@@ -62,7 +63,9 @@ The TUI keys are shown in context. The main controls are:
   scrobbling and `d` disconnects the account. Shared secrets and session keys
   are masked.
 - Verification: `f` toggles marked fallback publishing.
-- `s`: save configuration; `q`: quit.
+- `v`: review unsaved configuration changes; `s`: save configuration.
+- `q`: quit. If configuration is unsaved, TuneBeacon shows the pending changes
+  and asks whether to save, ignore them, or cancel quitting.
 
 MQTT passwords, webhook bearer tokens, and sensitive Last.fm credentials are
 masked in the interface. The [example configuration](config.example.toml)
