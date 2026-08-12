@@ -60,6 +60,9 @@ fn defaults_are_private_and_conservative() {
     assert!(config.lastfm.shared_secret.is_empty());
     assert!(config.lastfm.session_key.is_empty());
     assert!(config.lastfm.username.is_empty());
+    assert!(!config.listenbrainz.enabled);
+    assert!(config.listenbrainz.token.is_empty());
+    assert!(config.listenbrainz.username.is_empty());
     assert!(config.webhook.url.is_empty());
     assert!(config.webhook.bearer_token.is_none());
     assert!(!config.mqtt.retain);
@@ -79,6 +82,21 @@ fn daemon_accepts_lastfm_as_an_independent_output_when_authorized() {
     config.lastfm.session_key = "session-key".to_owned();
     config.lastfm.username = "listener".to_owned();
     assert!(config.validate_daemon().is_ok());
+}
+
+#[test]
+fn daemon_accepts_listenbrainz_as_an_independent_output_with_a_token() {
+    let mut config = Config::default();
+    config.listenbrainz.enabled = true;
+    assert!(config.validate_daemon().is_err());
+    config.listenbrainz.token = "user-token".to_owned();
+    assert!(config.validate_daemon().is_ok());
+}
+
+#[test]
+fn example_configuration_matches_the_current_schema() {
+    let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+    config.validate().unwrap();
 }
 
 #[test]

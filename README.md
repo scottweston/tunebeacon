@@ -3,8 +3,8 @@
 ![Screenshot](assets/screenshot_00.webp)
 
 TuneBeacon is a privacy-first Linux application that publishes verified “now
-playing” metadata from explicitly approved MPRIS players to MQTT, HTTP
-webhooks, and Last.fm.
+playing” metadata from explicitly approved MPRIS players to MQTT and HTTP
+webhooks, and scrobbles eligible playback to Last.fm and ListenBrainz.
 
 It is a single Rust binary with two modes:
 
@@ -29,6 +29,8 @@ explicitly allow one.
   QoS defaults to 1.
 - Last.fm scrobbling is disabled by default and uses the same MusicBrainz
   verification policy as the other outbound integrations.
+- ListenBrainz scrobbling is disabled by default. It submits enriched
+  MusicBrainz IDs when verification finds them.
 - Local `file://` artwork is displayed locally but never appears in published
   JSON.
 
@@ -49,7 +51,7 @@ permissions. Cached verification results and artwork live under
 
 The TUI keys are shown in context. The main controls are:
 
-- `1`–`6` or arrow keys: switch views.
+- `1`–`7` or arrow keys: switch views.
 - Players: configured players remain listed when offline. `Space` allows/denies;
   `Shift+Up/Down` changes priority.
 - MQTT: `Up/Down` selects a field and `Enter` edits it; input supports normal
@@ -62,14 +64,16 @@ The TUI keys are shown in context. The main controls are:
   account in a browser and `a` again when approval is complete. `e` enables
   scrobbling and `d` disconnects the account. Shared secrets and session keys
   are masked.
+- ListenBrainz: enter the user token from the ListenBrainz settings page, press
+  `c` to validate it, and `e` to enable scrobbling. `d` disconnects the account.
 - Verification: `f` toggles marked fallback publishing.
 - `v`: review unsaved configuration changes; `s`: save configuration.
 - `q`: quit. If configuration is unsaved, TuneBeacon shows the pending changes
   and asks whether to save, ignore them, or cancel quitting.
 
-MQTT passwords, webhook bearer tokens, and sensitive Last.fm credentials are
-masked in the interface. The [example configuration](config.example.toml)
-documents every v1 setting.
+MQTT passwords, webhook bearer tokens, sensitive Last.fm credentials, and the
+ListenBrainz user token are masked in the interface. The
+[example configuration](config.example.toml) documents every v1 setting.
 
 ## Last.fm scrobbling
 
@@ -84,12 +88,26 @@ half the track or four minutes has elapsed. Paused time does not count.
 Transient scrobble failures retry with backoff; now-playing failures do not
 retry. See Last.fm's [scrobbling guide](https://www.last.fm/api/scrobbling).
 
+## ListenBrainz scrobbling
+
+Copy the user token from [ListenBrainz settings](https://listenbrainz.org/settings/)
+into the ListenBrainz tab, press `c` to validate it and show the associated
+MusicBrainz username, then enable the output and save the configuration.
+
+TuneBeacon submits an optional `playing_now` notification and a permanent
+`single` listen using ListenBrainz's native API. The permanent listen uses the
+same pause-aware half-track-or-four-minute rule as Last.fm. Payloads include
+the recording, release, and release-group MBIDs when verification supplies
+them, along with duration and media-player metadata. Transient permanent-listen
+failures retry with backoff; `playing_now` failures do not retry. See the
+[ListenBrainz submission documentation](https://listenbrainz.readthedocs.io/en/latest/users/api/core.html#post--1-submit-listens).
+
 ## Daemon mode
 
 Daemon mode refuses to start unless at least one output is enabled and every
 enabled output is complete. MQTT requires its host, port, and topic; webhook
 delivery requires an `http://` or `https://` URL; Last.fm requires an API key,
-shared secret, and authorized session key:
+shared secret, and authorized session key; ListenBrainz requires a user token:
 
 ```console
 tunebeacon daemon

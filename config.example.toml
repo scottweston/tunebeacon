@@ -35,3 +35,10 @@ shared_secret = ""
 # masked in the TUI.
 session_key = ""
 username = ""
+
+[listenbrainz]
+enabled = false
+# Copy the user token from https://listenbrainz.org/settings/. The token is
+# masked in the TUI; press "c" there to validate it and show the account name.
+token = ""
+username = ""

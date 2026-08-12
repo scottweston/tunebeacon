@@ -5,9 +5,10 @@ use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::{Config, LastFmConfig, MqttConfig, WebhookConfig},
+    config::{Config, LastFmConfig, ListenBrainzConfig, MqttConfig, WebhookConfig},
     domain::{NowPlayingMessage, Player, TrackIdentity, Verification, VerificationStatus},
     lastfm::{LastFmPublisher, LastFmStatus, PlaybackTracker, ScrobbleAction},
+    listenbrainz::{ListenBrainzPublisher, ListenBrainzStatus},
     mpris::MprisMonitor,
     mqtt::{MqttPublisher, MqttStatus},
     selection::{PublicationGate, select_player},
@@ -23,6 +24,7 @@ pub struct RuntimeState {
     pub mqtt: MqttStatus,
     pub webhook: WebhookStatus,
     pub lastfm: LastFmStatus,
+    pub listenbrainz: ListenBrainzStatus,
     pub error: Option<String>,
 }
 
@@ -53,12 +55,15 @@ struct Outputs {
     webhook_gate: PublicationGate,
     lastfm_config: LastFmConfig,
     lastfm: Option<LastFmPublisher>,
+    listenbrainz_config: ListenBrainzConfig,
+    listenbrainz: Option<ListenBrainzPublisher>,
 }
 
 #[derive(Debug, Default)]
 struct OutputChanges {
     any: bool,
     lastfm: bool,
+    listenbrainz: bool,
 }
 
 impl Outputs {
@@ -76,6 +81,10 @@ impl Outputs {
         let lastfm = lastfm_config
             .enabled
             .then(|| LastFmPublisher::spawn(lastfm_config.clone()));
+        let listenbrainz_config = current.listenbrainz.clone();
+        let listenbrainz = listenbrainz_config
+            .enabled
+            .then(|| ListenBrainzPublisher::spawn(listenbrainz_config.clone()));
         Self {
             mqtt_config,
             mqtt,
@@ -85,6 +94,8 @@ impl Outputs {
             webhook_gate: PublicationGate::default(),
             lastfm_config,
             lastfm,
+            listenbrainz_config,
+            listenbrainz,
         }
     }
 
@@ -117,6 +128,15 @@ impl Outputs {
                 .then(|| LastFmPublisher::spawn(self.lastfm_config.clone()));
             changes.any = true;
             changes.lastfm = true;
+        }
+        if latest.listenbrainz != self.listenbrainz_config {
+            self.listenbrainz_config.clone_from(&latest.listenbrainz);
+            self.listenbrainz = self
+                .listenbrainz_config
+                .enabled
+                .then(|| ListenBrainzPublisher::spawn(self.listenbrainz_config.clone()));
+            changes.any = true;
+            changes.listenbrainz = true;
         }
         changes
     }
@@ -151,6 +171,14 @@ impl Outputs {
         if let Some(lastfm) = &self.lastfm {
             for action in actions {
                 lastfm.submit(action);
+            }
+        }
+    }
+
+    fn submit_listenbrainz(&self, actions: impl IntoIterator<Item = ScrobbleAction>) {
+        if let Some(listenbrainz) = &self.listenbrainz {
+            for action in actions {
+                listenbrainz.submit(action);
             }
         }
     }
@@ -196,6 +224,7 @@ async fn run_loop(
     let verifier = Arc::new(Verifier::new(cache_dir));
     let mut outputs = Outputs::new(&config).await;
     let mut lastfm_tracker = PlaybackTracker::default();
+    let mut listenbrainz_tracker = PlaybackTracker::default();
     let (verified_tx, mut verified_rx) = mpsc::channel::<VerifiedResult>(1);
     let mut active: Option<(String, TrackIdentity)> = None;
     let mut generation = 0_u64;
@@ -209,9 +238,7 @@ async fn run_loop(
             LoopEvent::Shutdown => break,
             LoopEvent::Refresh => {
                 let changes = outputs.refresh(&config).await;
-                if changes.lastfm {
-                    lastfm_tracker.reset();
-                }
+                reset_changed_trackers(&changes, &mut lastfm_tracker, &mut listenbrainz_tracker);
                 if changes.any {
                     // Re-evaluate the still-playing track so enabling or fixing an
                     // output does not require the user to change tracks.
@@ -222,17 +249,20 @@ async fn run_loop(
                         let allowlist = config.read().await.players.allowlist.clone();
                         let selected = select_player(&players, &allowlist).cloned();
                         let now = Instant::now();
-                        let actions = if outputs.lastfm.is_some() {
-                            if selected.is_some() {
-                                lastfm_tracker.observe(selected.as_ref(), now)
-                            } else {
-                                lastfm_tracker.pause(now)
-                            }
-                        } else {
-                            lastfm_tracker.reset();
-                            Vec::new()
-                        };
+                        let actions = playback_actions(
+                            &mut lastfm_tracker,
+                            outputs.lastfm.is_some(),
+                            selected.as_ref(),
+                            now,
+                        );
                         outputs.submit_lastfm(actions);
+                        let actions = playback_actions(
+                            &mut listenbrainz_tracker,
+                            outputs.listenbrainz.is_some(),
+                            selected.as_ref(),
+                            now,
+                        );
+                        outputs.submit_listenbrainz(actions);
                         let next = selected.as_ref().and_then(|player| {
                             player
                                 .track
@@ -246,6 +276,7 @@ async fn run_loop(
                             outputs.mqtt.as_ref(),
                             outputs.webhook.as_ref(),
                             outputs.lastfm.as_ref(),
+                            outputs.listenbrainz.as_ref(),
                         )
                         .await;
                         if next != active {
@@ -278,10 +309,40 @@ async fn run_loop(
                     &state,
                     &mut outputs,
                     &mut lastfm_tracker,
+                    &mut listenbrainz_tracker,
                 )
                 .await;
             }
         }
+    }
+}
+
+fn reset_changed_trackers(
+    changes: &OutputChanges,
+    lastfm: &mut PlaybackTracker,
+    listenbrainz: &mut PlaybackTracker,
+) {
+    if changes.lastfm {
+        lastfm.reset();
+    }
+    if changes.listenbrainz {
+        listenbrainz.reset();
+    }
+}
+
+fn playback_actions(
+    tracker: &mut PlaybackTracker,
+    enabled: bool,
+    selected: Option<&Player>,
+    now: Instant,
+) -> Vec<ScrobbleAction> {
+    if !enabled {
+        tracker.reset();
+        return Vec::new();
+    }
+    match selected {
+        Some(player) => tracker.observe(Some(player), now),
+        None => tracker.pause(now),
     }
 }
 
@@ -310,6 +371,7 @@ async fn update_state(
     mqtt: Option<&MqttPublisher>,
     webhook: Option<&WebhookPublisher>,
     lastfm: Option<&LastFmPublisher>,
+    listenbrainz: Option<&ListenBrainzPublisher>,
 ) {
     let mqtt_status = if let Some(mqtt) = mqtt {
         mqtt.status().await
@@ -326,6 +388,11 @@ async fn update_state(
     } else {
         LastFmStatus::default()
     };
+    let listenbrainz_status = if let Some(listenbrainz) = listenbrainz {
+        listenbrainz.status().await
+    } else {
+        ListenBrainzStatus::default()
+    };
     let mut current = state.write().await;
     current.players = players;
     current.selected = selected.cloned();
@@ -333,6 +400,7 @@ async fn update_state(
     current.mqtt = mqtt_status;
     current.webhook = webhook_status;
     current.lastfm = lastfm_status;
+    current.listenbrainz = listenbrainz_status;
 }
 
 async fn handle_verified(
@@ -342,6 +410,7 @@ async fn handle_verified(
     state: &RwLock<RuntimeState>,
     outputs: &mut Outputs,
     lastfm_tracker: &mut PlaybackTracker,
+    listenbrainz_tracker: &mut PlaybackTracker,
 ) {
     if result.generation != generation {
         return;
@@ -359,8 +428,12 @@ async fn handle_verified(
     if eligible && let Some(track) = &result.player.track {
         let message = NowPlayingMessage::new(&result.player, track, result.verification.clone());
         outputs.publish(&result.player, message);
-        let actions = lastfm_tracker.authorize(&result.player, result.verification, Instant::now());
+        let actions =
+            lastfm_tracker.authorize(&result.player, result.verification.clone(), Instant::now());
         outputs.submit_lastfm(actions);
+        let actions =
+            listenbrainz_tracker.authorize(&result.player, result.verification, Instant::now());
+        outputs.submit_listenbrainz(actions);
     }
 }
 

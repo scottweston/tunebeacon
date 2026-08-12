@@ -1,8 +1,8 @@
 [package]
 name = "tunebeacon"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Privacy-first MPRIS now-playing delivery over MQTT and webhooks"
+description = "Privacy-first MPRIS now-playing delivery and scrobbling"
 license = "MIT"
 repository = "https://github.com/scottweston/tunebeacon"
 

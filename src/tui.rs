@@ -28,7 +28,7 @@ use crate::{
     config::Config,
     domain::PlaybackStatus,
     lastfm::{self, Authorization},
-    mqtt,
+    listenbrainz, mqtt,
     runtime::{Runtime, RuntimeState},
     webhook,
 };
@@ -40,16 +40,18 @@ enum Tab {
     Mqtt,
     Webhook,
     LastFm,
+    ListenBrainz,
     Verification,
 }
 
 impl Tab {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::NowPlaying,
         Self::Players,
         Self::Mqtt,
         Self::Webhook,
         Self::LastFm,
+        Self::ListenBrainz,
         Self::Verification,
     ];
 
@@ -60,7 +62,8 @@ impl Tab {
             Self::Mqtt => 2,
             Self::Webhook => 3,
             Self::LastFm => 4,
-            Self::Verification => 5,
+            Self::ListenBrainz => 5,
+            Self::Verification => 6,
         }
     }
 }
@@ -98,6 +101,7 @@ struct App {
     lastfm_field: usize,
     lastfm_input: Input,
     lastfm_authorization: Option<Authorization>,
+    listenbrainz_input: Input,
     editing: bool,
     dialog: Option<Dialog>,
     changes_scroll: u16,
@@ -146,6 +150,7 @@ pub async fn run(config: Config, config_path: PathBuf, cache_dir: PathBuf) -> Re
         lastfm_field: 0,
         lastfm_input: Input::default(),
         lastfm_authorization: None,
+        listenbrainz_input: Input::default(),
         editing: false,
         dialog: None,
         changes_scroll: 0,
@@ -240,6 +245,18 @@ impl App {
                             }
                             changed
                         }
+                        Tab::ListenBrainz => {
+                            let changed = self
+                                .listenbrainz_input
+                                .handle_event(&Event::Key(key))
+                                .is_some();
+                            if changed {
+                                self.config.listenbrainz.token =
+                                    self.listenbrainz_input.value().to_owned();
+                                self.config.listenbrainz.username.clear();
+                            }
+                            changed
+                        }
                         _ => false,
                     };
                     if changed {
@@ -258,9 +275,10 @@ impl App {
             KeyCode::Char('3') => self.tab = Tab::Mqtt,
             KeyCode::Char('4') => self.tab = Tab::Webhook,
             KeyCode::Char('5') => self.tab = Tab::LastFm,
-            KeyCode::Char('6') => self.tab = Tab::Verification,
-            KeyCode::Left => self.tab = Tab::ALL[(self.tab.index() + 5) % 6],
-            KeyCode::Right => self.tab = Tab::ALL[(self.tab.index() + 1) % 6],
+            KeyCode::Char('6') => self.tab = Tab::ListenBrainz,
+            KeyCode::Char('7') => self.tab = Tab::Verification,
+            KeyCode::Left => self.tab = Tab::ALL[(self.tab.index() + 6) % 7],
+            KeyCode::Right => self.tab = Tab::ALL[(self.tab.index() + 1) % 7],
             KeyCode::Char('s') => self.save()?,
             KeyCode::Char('v') if self.is_dirty() => self.open_dialog(Dialog::ReviewChanges),
             _ => match self.tab {
@@ -268,6 +286,7 @@ impl App {
                 Tab::Mqtt => self.handle_mqtt_key(key).await?,
                 Tab::Webhook => self.handle_webhook_key(key).await?,
                 Tab::LastFm => self.handle_lastfm_key(key).await?,
+                Tab::ListenBrainz => self.handle_listenbrainz_key(key).await,
                 Tab::Verification => {
                     if matches!(key.code, KeyCode::Char('f' | ' ')) {
                         self.config.verification.publish_unverified =
@@ -590,6 +609,46 @@ impl App {
         }
     }
 
+    async fn handle_listenbrainz_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                self.editing = true;
+                self.listenbrainz_input = Input::from(self.config.listenbrainz.token.clone());
+            }
+            KeyCode::Char('e') => {
+                self.config.listenbrainz.enabled = !self.config.listenbrainz.enabled;
+                self.sync_config().await;
+            }
+            KeyCode::Char('d') => {
+                self.config.listenbrainz.enabled = false;
+                self.config.listenbrainz.token.clear();
+                self.config.listenbrainz.username.clear();
+                self.sync_config().await;
+                self.show_message("ListenBrainz account disconnected", Duration::from_secs(3));
+            }
+            KeyCode::Char('c') => {
+                match listenbrainz::validate_token(&self.config.listenbrainz).await {
+                    Ok(username) => {
+                        self.config.listenbrainz.username = username;
+                        self.sync_config().await;
+                        self.show_message(
+                            format!(
+                                "ListenBrainz token is valid for {}",
+                                self.config.listenbrainz.username
+                            ),
+                            Duration::from_secs(4),
+                        );
+                    }
+                    Err(error) => self.show_message(
+                        format!("ListenBrainz validation failed: {error:#}"),
+                        Duration::from_secs(6),
+                    ),
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn move_priority(&mut self, direction: isize) {
         let Some(key) = self.player_row_keys().get(self.player_cursor).cloned() else {
             return;
@@ -761,6 +820,7 @@ impl App {
                 "MQTT",
                 "Webhook",
                 "Last.fm",
+                "ListenBrainz",
                 "Verification",
             ])
             .select(self.tab.index())
@@ -774,6 +834,7 @@ impl App {
             Tab::Mqtt => self.draw_mqtt(frame, areas[1]),
             Tab::Webhook => self.draw_webhook(frame, areas[1]),
             Tab::LastFm => self.draw_lastfm(frame, areas[1]),
+            Tab::ListenBrainz => self.draw_listenbrainz(frame, areas[1]),
             Tab::Verification => self.draw_verification(frame, areas[1]),
         }
         let footer = if change_count > 0 {
@@ -785,7 +846,7 @@ impl App {
                 Span::raw("  v review  s save  q quit"),
             ])
         } else if self.message.is_empty() {
-            Line::from("1–6/←→ tabs  s save  q quit")
+            Line::from("1–7/←→ tabs  s save  q quit")
         } else {
             Line::from(self.message.clone())
         };
@@ -905,6 +966,14 @@ impl App {
                     "Last.fm",
                     if self.config.lastfm.enabled {
                         &self.state.lastfm.detail
+                    } else {
+                        "disabled"
+                    },
+                ),
+                detail(
+                    "ListenBrainz",
+                    if self.config.listenbrainz.enabled {
+                        &self.state.listenbrainz.detail
                     } else {
                         "disabled"
                     },
@@ -1229,6 +1298,65 @@ impl App {
         }
     }
 
+    fn draw_listenbrainz(&self, frame: &mut Frame, area: Rect) {
+        let block = Block::bordered().title(" ListenBrainz scrobbling ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.is_empty() {
+            return;
+        }
+        let account = if self.config.listenbrainz.username.is_empty() {
+            "not validated"
+        } else {
+            self.config.listenbrainz.username.as_str()
+        };
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Enabled: {}   Account: {}   Status: {}",
+                yes_no(self.config.listenbrainz.enabled),
+                account,
+                if self.config.listenbrainz.enabled {
+                    self.state.listenbrainz.detail.as_str()
+                } else {
+                    "disabled"
+                }
+            )),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        self.draw_input_field(
+            frame,
+            inner,
+            0,
+            0,
+            "Token",
+            &self.config.listenbrainz.token,
+            true,
+            &self.listenbrainz_input,
+        );
+        let instructions_y = inner.y.saturating_add(4);
+        if instructions_y < inner.bottom() {
+            frame.render_widget(
+                Paragraph::new(
+                    "Copy your user token from listenbrainz.org/settings, then press c to validate it.",
+                )
+                .wrap(Wrap { trim: true }),
+                Rect::new(
+                    inner.x,
+                    instructions_y,
+                    inner.width,
+                    inner.bottom().saturating_sub(instructions_y).min(2),
+                ),
+            );
+        }
+        let help_y = inner.bottom().saturating_sub(1);
+        if help_y >= inner.y {
+            frame.render_widget(
+                Paragraph::new("Enter edit token  c validate  e enable  d disconnect"),
+                Rect::new(inner.x, help_y, inner.width, 1),
+            );
+        }
+    }
+
     fn draw_verification(&self, frame: &mut Frame, area: Rect) {
         let (mode, mode_style) = if self.config.verification.publish_unverified {
             (
@@ -1281,6 +1409,7 @@ fn configuration_changes(saved: &Config, current: &Config) -> Vec<ConfigurationC
     mqtt_configuration_changes(&mut changes, saved, current);
     webhook_configuration_changes(&mut changes, saved, current);
     lastfm_configuration_changes(&mut changes, saved, current);
+    listenbrainz_configuration_changes(&mut changes, saved, current);
     changes
 }
 
@@ -1454,6 +1583,33 @@ fn lastfm_configuration_changes(
     );
 }
 
+fn listenbrainz_configuration_changes(
+    changes: &mut Vec<ConfigurationChange>,
+    saved: &Config,
+    current: &Config,
+) {
+    push_change(
+        changes,
+        "ListenBrainz enabled",
+        &saved.listenbrainz.enabled,
+        &current.listenbrainz.enabled,
+        |value| enabled_disabled(*value),
+    );
+    push_secret_change(
+        changes,
+        "ListenBrainz token",
+        Some(&saved.listenbrainz.token),
+        Some(&current.listenbrainz.token),
+    );
+    push_change(
+        changes,
+        "ListenBrainz username",
+        &saved.listenbrainz.username,
+        &current.listenbrainz.username,
+        display_string,
+    );
+}
+
 fn push_change<T: PartialEq>(
     changes: &mut Vec<ConfigurationChange>,
     label: &str,
@@ -1526,6 +1682,7 @@ mod tests {
         config.webhook.bearer_token = Some("do-not-render-token".to_owned());
         config.lastfm.shared_secret = "do-not-render-secret".to_owned();
         config.lastfm.session_key = "do-not-render-session".to_owned();
+        config.listenbrainz.token = "do-not-render-listenbrainz-token".to_owned();
         let (artwork_sender, artwork_results) = tokio::sync::mpsc::unbounded_channel();
         let (encoding_sender, encoding_results) = tokio::sync::mpsc::unbounded_channel();
         App {
@@ -1545,6 +1702,7 @@ mod tests {
             lastfm_field: 0,
             lastfm_input: Input::default(),
             lastfm_authorization: None,
+            listenbrainz_input: Input::default(),
             editing: false,
             dialog: None,
             changes_scroll: 0,
@@ -1677,6 +1835,13 @@ mod tests {
         let rendered = render(100, 24, app(Tab::LastFm));
         assert!(!rendered.contains("do-not-render-secret"));
         assert!(!rendered.contains("do-not-render-session"));
+        assert!(rendered.contains("••••"));
+    }
+
+    #[test]
+    fn listenbrainz_layout_masks_token() {
+        let rendered = render(100, 24, app(Tab::ListenBrainz));
+        assert!(!rendered.contains("do-not-render-listenbrainz-token"));
         assert!(rendered.contains("••••"));
     }
 

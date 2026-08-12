@@ -20,6 +20,7 @@ pub struct Config {
     pub mqtt: MqttConfig,
     pub webhook: WebhookConfig,
     pub lastfm: LastFmConfig,
+    pub listenbrainz: ListenBrainzConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -68,6 +69,14 @@ pub struct LastFmConfig {
     pub username: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct ListenBrainzConfig {
+    pub enabled: bool,
+    pub token: String,
+    pub username: String,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -77,6 +86,7 @@ impl Default for Config {
             mqtt: MqttConfig::default(),
             webhook: WebhookConfig::default(),
             lastfm: LastFmConfig::default(),
+            listenbrainz: ListenBrainzConfig::default(),
         }
     }
 }
@@ -151,8 +161,12 @@ impl Config {
     /// incomplete.
     pub fn validate_daemon(&self) -> Result<()> {
         self.validate()?;
-        if !self.mqtt.enabled && !self.webhook.enabled && !self.lastfm.enabled {
-            bail!("daemon mode requires MQTT, webhook, or Last.fm to be enabled");
+        if !self.mqtt.enabled
+            && !self.webhook.enabled
+            && !self.lastfm.enabled
+            && !self.listenbrainz.enabled
+        {
+            bail!("daemon mode requires MQTT, webhook, Last.fm, or ListenBrainz to be enabled");
         }
         if self.mqtt.enabled {
             if self.mqtt.host.trim().is_empty() {
@@ -170,6 +184,9 @@ impl Config {
         }
         if self.lastfm.enabled {
             validate_lastfm(&self.lastfm)?;
+        }
+        if self.listenbrainz.enabled {
+            validate_listenbrainz(&self.listenbrainz)?;
         }
         Ok(())
     }
@@ -230,6 +247,18 @@ pub fn validate_lastfm(config: &LastFmConfig) -> Result<()> {
     }
     if config.session_key.trim().is_empty() {
         bail!("lastfm.session_key must be authorized");
+    }
+    Ok(())
+}
+
+/// Validate the credential required for `ListenBrainz` submissions.
+///
+/// # Errors
+///
+/// Returns an error when the user token is missing.
+pub fn validate_listenbrainz(config: &ListenBrainzConfig) -> Result<()> {
+    if config.token.trim().is_empty() {
+        bail!("listenbrainz.token must be configured");
     }
     Ok(())
 }
